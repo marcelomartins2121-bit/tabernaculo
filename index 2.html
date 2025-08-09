@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tabernáculo 3D Interativo</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:#0b0b10; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    #app { position:fixed; inset:0; display:flex; }
+    #hud { position:fixed; top:0; left:0; right:0; display:flex; gap:.5rem; padding:.6rem; align-items:flex-start; z-index:10; pointer-events:none; }
+    .card { pointer-events:auto; background:rgba(18,18,24,.75); color:#fff; border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:.6rem .8rem; box-shadow:0 10px 30px rgba(0,0,0,.35); backdrop-filter: blur(6px); }
+    .row { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; }
+    .title { font-weight:700; letter-spacing:.2px; margin-bottom:.25rem; }
+    button { cursor:pointer; background:#3f51b5; color:white; border:none; border-radius:10px; padding:.45rem .65rem; font-weight:600; }
+    button.secondary { background:#222; border:1px solid #444; }
+    label { opacity:.9; font-size:.85rem; }
+    input[type="number"] { width:6.5rem; border-radius:8px; border:1px solid #444; background:#14141a; color:#fff; padding:.35rem .45rem; }
+    #help { max-width:560px; line-height:1.35; font-size:.92rem; }
+    #label { position:fixed; bottom:12px; left:50%; transform:translateX(-50%); color:#ddd; font-size:.9rem; background:rgba(0,0,0,.5); padding:.4rem .6rem; border-radius:8px; pointer-events:none; }
+    #loading { position:fixed; inset:0; display:grid; place-items:center; color:#ddd; background:#0b0b10; z-index:100; }
+    .reticle { position:fixed; top:50%; left:50%; width:10px; height:10px; margin-left:-5px; margin-top:-5px; border-radius:50%; outline:2px solid rgba(255,255,255,.6); outline-offset:-2px; opacity:.6; }
+    @media (hover:none) { .reticle{display:none;} }
+    #minimapWrap { position:fixed; right:10px; top:10px; z-index:11; }
+    #minimap { width:160px; height:120px; border-radius:10px; background:#0d0d12; border:1px solid rgba(255,255,255,.08); box-shadow:0 6px 20px rgba(0,0,0,.35); }
+    .tp-list { display:grid; grid-template-columns: 1fr 1fr; gap:.4rem; margin-top:.35rem; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="loading">Carregando cena…</div>
+  <div id="hud" class="row">
+    <div class="card" id="help">
+      <div class="title">Tabernáculo (Êxodo) – Tour Interativo</div>
+      <div>
+        <b>PC:</b> WASD/setas para andar, mouse para olhar, Espaço para travar o cursor. <b>Toque:</b> toque no chão para ir até o ponto. <b>Objetos:</b> clique/toque para ver descrições.
+      </div>
+      <div class="row" style="margin-top:.4rem">
+        <label>1 cúbito (m):</label>
+        <input id="cubitInput" type="number" step="0.001" min="0.40" max="0.60" value="0.525" />
+        <button id="applyCubit" class="secondary">Aplicar</button>
+      </div>
+    </div>
+    <div class="card row">
+      <button id="lockBtn">Entrar/Parar controle</button>
+      <button id="toggleDay" class="secondary">Alternar Dia/Noite</button>
+      <button id="resetBtn" class="secondary">Reiniciar posição</button>
+    </div>
+    <div class="card" style="pointer-events:auto">
+      <div class="title">Teleporte rápido</div>
+      <div class="tp-list">
+        <button class="tp" data-id="gate">Portão Leste</button>
+        <button class="tp" data-id="altar">Pátio (Altar)</button>
+        <button class="tp" data-id="holy">Lugar Santo</button>
+        <button class="tp" data-id="mostholy">Santíssimo</button>
+      </div>
+    </div>
+  </div>
+  <div id="minimapWrap">
+    <canvas id="minimap" width="160" height="120"></canvas>
+  </div>
+  <div id="label">Toque ou clique no chão para caminhar. Clique em objetos para ver descrições.</div>
+  <div class="reticle"></div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.160.1/build/three.module.js";
+    import { OrbitControls } from "https://unpkg.com/three@0.160.1/examples/jsm/controls/OrbitControls.js";
+
+    // ======= Parâmetros (ajustáveis) =======
+    let CUBIT = 0.525; // valor inicial; pode ser alterado via input
+    const DIM = () => ({
+      courtyard: { length: 100 * CUBIT, width: 50 * CUBIT, wallH: 5 * CUBIT }, // Êx 27
+      tent: { length: 30 * CUBIT, width: 10 * CUBIT, height: 10 * CUBIT },     // Êx 26
+      gateWidth: 20 * CUBIT                                                    // Êx 27:16
+    });
+
+    // ======= Render básico =======
+    const app = document.getElementById('app');
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    app.appendChild(renderer.domElement);
+
+    let scene, camera, controls, hemi, sun, courtFloor, courtGroup, tentGroup;
+    let pickables = [], colliders = [];
+    let objects = {};
+
+    const clock = new THREE.Clock();
+
+    // ======= Materiais – paleta próxima a Êxodo =======
+    const MAT = {
+      linen:   new THREE.MeshPhysicalMaterial({ color: 0xFFFFFF, roughness: 0.9 }), // linho fino
+      blue:    new THREE.MeshStandardMaterial({ color: 0x1F4BA0, roughness: 0.7 }), // azul
+      purple:  new THREE.MeshStandardMaterial({ color: 0x6B3FA0, roughness: 0.7 }), // púrpura
+      scarlet: new THREE.MeshStandardMaterial({ color: 0xA02030, roughness: 0.7 }), // carmesim
+      gold:    new THREE.MeshStandardMaterial({ color: 0xD4AF37, metalness: 0.85, roughness: 0.3 }),
+      bronze:  new THREE.MeshStandardMaterial({ color: 0x8C7853, metalness: 0.5,  roughness: 0.6 }),
+      wood:    new THREE.MeshStandardMaterial({ color: 0x6E5A44, roughness: 0.9 })
+    };
+
+    // ======= Construção =======
+    function buildScene(){
+      const { courtyard, tent, gateWidth } = DIM();
+
+      // Limpar
+      if(scene){
+        renderer.dispose();
+      }
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0b0b10);
+      pickables = []; colliders = []; objects = {};
+
+      camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.1, 1000);
+      camera.position.set(courtyard.length/2 - 4, 1.7, 0);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enablePan = false; controls.enableDamping = true; controls.maxPolarAngle = Math.PI/2.05;
+
+      hemi = new THREE.HemisphereLight(0xffffff, 0x404050, 0.38); scene.add(hemi);
+      sun = new THREE.DirectionalLight(0xffffff, 1.0); sun.position.set(30, 50, 20); sun.castShadow = true; sun.shadow.mapSize.set(2048,2048); scene.add(sun);
+
+      // Terreno
+      const groundGeo = new THREE.PlaneGeometry(courtyard.length*2.2, courtyard.width*2.2);
+      const groundMat = new THREE.MeshStandardMaterial({ color: 0x7a6a4d, roughness: 1 });
+      const ground = new THREE.Mesh(groundGeo, groundMat); ground.rotation.x = -Math.PI/2; ground.receiveShadow = true; scene.add(ground);
+
+      // Pátio (cortinas de linho e postes)
+      courtGroup = new THREE.Group(); scene.add(courtGroup);
+      const wallMat = MAT.linen; const postMat = MAT.wood;
+      function makeWall(length, thickness=0.05) { const g = new THREE.BoxGeometry(length, courtyard.wallH, thickness); const wall = new THREE.Mesh(g, wallMat); wall.receiveShadow = true; return wall; }
+      function makePosts(count, spacing, y= courtyard.wallH/2) {
+        const posts = new THREE.Group(); const g = new THREE.CylinderGeometry(0.05,0.05,courtyard.wallH+0.3,12);
+        for (let i=0;i<count;i++) { const p = new THREE.Mesh(g, postMat); p.position.set(-((count-1)/2)*spacing + i*spacing, y, 0); p.castShadow = true; p.receiveShadow = true; posts.add(p);} return posts; }
+
+      const wallNorth = makeWall(courtyard.length); wallNorth.position.set(0, courtyard.wallH/2, -courtyard.width/2);
+      const wallSouth = makeWall(courtyard.length); wallSouth.position.set(0, courtyard.wallH/2,  courtyard.width/2);
+      const wallWest  = makeWall(courtyard.width);  wallWest.rotation.y = Math.PI/2; wallWest.position.set(-courtyard.length/2, courtyard.wallH/2, 0);
+
+      const gateSide = (courtyard.length - gateWidth)/2;
+      const wallEastA = makeWall(gateSide); wallEastA.rotation.y = Math.PI/2; wallEastA.position.set(courtyard.length/2 - gateSide/2, courtyard.wallH/2, -courtyard.width/2);
+      const wallEastB = makeWall(gateSide); wallEastB.rotation.y = Math.PI/2; wallEastB.position.set(courtyard.length/2 - gateSide/2, courtyard.wallH/2,  courtyard.width/2);
+
+      const postsNorth = makePosts(26, courtyard.length/25); postsNorth.position.set(0,0,-courtyard.width/2);
+      const postsSouth = makePosts(26, courtyard.length/25); postsSouth.position.set(0,0, courtyard.width/2);
+      const postsWest  = makePosts(14, courtyard.width/13); postsWest.rotation.y = Math.PI/2; postsWest.position.set(-courtyard.length/2,0,0);
+
+      courtGroup.add(wallNorth, wallSouth, wallWest, wallEastA, wallEastB, postsNorth, postsSouth, postsWest);
+
+      // Portão Leste (cortina colorida) com animação de abertura
+      function makeCurtain(width, height, mat){ const geo = new THREE.PlaneGeometry(width, height); const mesh = new THREE.Mesh(geo, mat); mesh.rotation.y = Math.PI/2; mesh.castShadow=false; return mesh; }
+      const gateCurtain = makeCurtain(gateWidth, courtyard.wallH, MAT.purple); gateCurtain.position.set(courtyard.length/2 - 0.05, courtyard.wallH/2, 0); scene.add(gateCurtain);
+      objects.gateCurtain = gateCurtain;
+
+      // Tabernáculo (tenda)
+      tentGroup = new THREE.Group(); scene.add(tentGroup);
+      const tentBodyGeo = new THREE.BoxGeometry(tent.length, tent.height, tent.width);
+      const tentBody = new THREE.Mesh(tentBodyGeo, MAT.wood); tentBody.castShadow = true; tentBody.receiveShadow = true;
+      tentBody.position.set(-courtyard.length/2 + tent.length/2 + 8*CUBIT, tent.height/2, 0);
+      tentGroup.add(tentBody); objects.tentBody = tentBody;
+
+      // Véu (divisão) e cortina de entrada
+      const veilX = tentBody.position.x + tent.length/2 - (10*CUBIT);
+      const veil = new THREE.Mesh(new THREE.BoxGeometry(0.05, tent.height, tent.width-0.2), MAT.scarlet); veil.position.set(veilX, tent.height/2, 0); veil.name = "Véu"; tentGroup.add(veil); objects.veil = veil;
+      const entranceX = tentBody.position.x + tent.length/2 - 0.05;
+      const tentCurtain = makeCurtain(tent.width-0.2, tent.height, MAT.purple); tentCurtain.position.set(entranceX, tent.height/2, 0); tentCurtain.name = "Entrada da Tenda"; tentGroup.add(tentCurtain); objects.tentCurtain = tentCurtain;
+
+      // Mobiliário
+      pickables = [];
+      function labelize(mesh, title, desc) { mesh.userData.title = title; mesh.userData.desc = desc; pickables.push(mesh); }
+
+      const altar = new THREE.Mesh(new THREE.BoxGeometry(5*CUBIT, 3*CUBIT, 5*CUBIT), MAT.bronze); altar.castShadow = true; altar.receiveShadow = true; altar.position.set(courtyard.length/2 - 16*CUBIT, 1.5*CUBIT, 0); labelize(altar, "Altar de Bronze", "Holocaustos (Êx 27). Bronze: juízo."); scene.add(altar); objects.altar = altar;
+      const laver = new THREE.Mesh(new THREE.CylinderGeometry(1.2*CUBIT, 1.2*CUBIT, 0.7*CUBIT, 24), MAT.bronze); laver.castShadow = true; laver.receiveShadow = true; laver.position.set(courtyard.length/2 - 26*CUBIT, 0.35*CUBIT, -2*CUBIT); labelize(laver, "Bacia de Bronze", "Purificação (Êx 30:17-21)."); scene.add(laver); objects.laver = laver;
+      const table = new THREE.Mesh(new THREE.BoxGeometry(3*CUBIT, 2*CUBIT, 2*CUBIT), MAT.gold); table.castShadow = true; table.receiveShadow = true; table.position.set(veilX - 6*CUBIT, 1*CUBIT, - (tent.width/2 - 1*CUBIT)); labelize(table, "Mesa dos Pães", "Doze pães (Êx 25:23-30)."); scene.add(table); objects.table = table;
+      const menorah = new THREE.Mesh(new THREE.CylinderGeometry(0.2*CUBIT, 0.3*CUBIT, 2.5*CUBIT, 12), MAT.gold); menorah.castShadow = true; menorah.receiveShadow = true; menorah.position.set(veilX - 6*CUBIT, 1.25*CUBIT, (tent.width/2 - 1*CUBIT)); labelize(menorah, "Candelabro (Menorá)", "Sete lâmpadas (Êx 25:31-40)."); scene.add(menorah); objects.menorah = menorah;
+      const incense = new THREE.Mesh(new THREE.BoxGeometry(1.5*CUBIT, 2.5*CUBIT, 1.5*CUBIT), MAT.gold); incense.castShadow = true; incense.receiveShadow = true; incense.position.set(veilX - 0.8*CUBIT, 1.25*CUBIT, 0); labelize(incense, "Altar de Incenso", "Incenso contínuo (Êx 30:1-10)."); scene.add(incense); objects.incense = incense;
+      const ark = new THREE.Mesh(new THREE.BoxGeometry(2.5*CUBIT, 1.5*CUBIT, 1.5*CUBIT), MAT.gold); ark.castShadow = true; ark.receiveShadow = true; ark.position.set(veilX + 4.5*CUBIT, 0.9*CUBIT, 0); labelize(ark, "Arca da Aliança", "Propiciatório e querubins (Êx 25:10-22)."); scene.add(ark); objects.ark = ark;
+
+      // Chão da corte para raycast
+      const courtFloorGeo = new THREE.PlaneGeometry(courtyard.length-2*CUBIT, courtyard.width-2*CUBIT);
+      courtFloor = new THREE.Mesh(courtFloorGeo, new THREE.MeshBasicMaterial({visible:false})); courtFloor.rotation.x = -Math.PI/2; courtFloor.position.set(0,0.01,0); scene.add(courtFloor);
+
+      // Colisores finos (AABB com margem negativa)
+      function addColliderFrom(mesh, shrink=0.06*CUBIT){ const box = new THREE.Box3().setFromObject(mesh).expandByScalar(-shrink); colliders.push(box); }
+      [wallNorth, wallSouth, wallWest, wallEastA, wallEastB, tentBody, objects.veil, objects.tentCurtain, altar, laver, table, menorah, incense, ark].forEach(m=> addColliderFrom(m));
+
+      // UI
+      bindUI(courtyard, tent);
+    }
+
+    // ======= UI e Interatividade =======
+    const lockBtn = document.getElementById('lockBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const toggleDay = document.getElementById('toggleDay');
+    const cubitInput = document.getElementById('cubitInput');
+    const applyCubit = document.getElementById('applyCubit');
+
+    lockBtn.onclick = togglePointerLock;
+    toggleDay.onclick = ()=>{ const isNight = sun.intensity>0.5; if(isNight){ sun.intensity=0.15; hemi.intensity=0.06; scene.background.set(0x05060a);} else { sun.intensity=1.0; hemi.intensity=0.38; scene.background.set(0x0b0b10);} };
+    resetBtn.onclick = ()=>{ const {courtyard}=DIM(); camera.position.set(courtyard.length/2 - 4, 1.7, 0); camera.lookAt(0,1.5,0); controls.update(); };
+    applyCubit.onclick = ()=>{ const v=parseFloat(cubitInput.value); if(!isNaN(v) && v>0.4 && v<0.6){ CUBIT=v; buildScene(); }};
+
+    function togglePointerLock(){ if(document.pointerLockElement===renderer.domElement){ document.exitPointerLock(); } else { renderer.domElement.requestPointerLock(); } }
+
+    // Teleporte rápido
+    function teleportTo(id){
+      const { courtyard, tent } = DIM();
+      const tBody = objects.tentBody;
+      if(id==='gate') camera.position.set(courtyard.length/2 - 2*CUBIT, 1.7, 0);
+      if(id==='altar') camera.position.set(courtyard.length/2 - 18*CUBIT, 1.7, 0);
+      if(id==='holy') camera.position.set(tBody.position.x + tent.length/2 - 6*CUBIT, 1.7, tent.width/2 - 2*CUBIT);
+      if(id==='mostholy') camera.position.set(tBody.position.x + tent.length/2 - 2*CUBIT, 1.7, 0);
+    }
+    document.querySelectorAll('.tp').forEach(b=> b.addEventListener('click',()=> teleportTo(b.dataset.id)));
+
+    // ======= Clique/Toque e Movimento =======
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    let moveTarget = null; const keys = new Set();
+    window.addEventListener('keydown', e=>{ keys.add(e.code); if(e.code==='Space') togglePointerLock(); });
+    window.addEventListener('keyup', e=> keys.delete(e.code));
+
+    function onPointerDown(ev){
+      const rect = renderer.domElement.getBoundingClientRect();
+      const x = ((ev.clientX - rect.left)/rect.width)*2 - 1;
+      const y = -((ev.clientY - rect.top)/rect.height)*2 + 1; mouse.set(x,y);
+
+      raycaster.setFromCamera(mouse, camera);
+      const pickHits = raycaster.intersectObjects(pickables, true);
+      if(pickHits.length){ showInfo(pickHits[0].object); return; }
+      const groundHits = raycaster.intersectObject(courtFloor, false);
+      if(groundHits.length){ moveTarget = groundHits[0].point.clone(); }
+    }
+    function onTouchStart(ev){ if(ev.touches && ev.touches.length){ onPointerDown(ev.touches[0]); } }
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    renderer.domElement.addEventListener('touchstart', onTouchStart, {passive:true});
+
+    // ======= Info HUD =======
+    const infoDiv = document.createElement('div'); infoDiv.className = 'card'; infoDiv.style.position='fixed'; infoDiv.style.right='12px'; infoDiv.style.bottom='12px'; infoDiv.style.maxWidth='360px'; infoDiv.style.display='none'; infoDiv.style.zIndex=11; document.body.appendChild(infoDiv);
+    function showInfo(obj){ const {title, desc} = obj.userData || {}; if(!title) return; infoDiv.innerHTML = `<div class="title">${title}</div><div>${desc}</div>`; infoDiv.style.display = 'block'; setTimeout(()=>{ infoDiv.style.display='none'; }, 7000); }
+
+    // ======= Minimapa =======
+    const map = document.getElementById('minimap'); const mctx = map.getContext('2d');
+    function drawMinimap(){
+      const { courtyard, tent } = DIM();
+      mctx.clearRect(0,0,map.width,map.height);
+      // escala para caber no canvas
+      const sx = map.width / (courtyard.length*1.2); const sz = map.height / (courtyard.width*1.2); const scale = Math.min(sx, sz);
+      const cx = map.width/2; const cz = map.height/2;
+      mctx.strokeStyle = '#9aa1b7'; mctx.lineWidth = 2;
+      // pátio
+      mctx.strokeRect(cx - (courtyard.length/2)*scale, cz - (courtyard.width/2)*scale, courtyard.length*scale, courtyard.width*scale);
+      // tenda
+      const tBody = objects.tentBody; if(tBody){
+        const x = (tBody.position.x - (tent.length/2))*scale; const z = (-tent.width/2)*scale; // canto suposto
+        mctx.strokeRect(cx + x, cz + z, tent.length*scale, tent.width*scale);
+      }
+      // câmera
+      const p = camera.position; mctx.fillStyle = '#ffffff'; mctx.beginPath(); mctx.arc(cx + p.x*scale, cz + (-p.z)*scale, 3.5, 0, Math.PI*2); mctx.fill();
+    }
+
+    // ======= Portas/cortinas animadas =======
+    function updateCurtains(){
+      if(!objects.gateCurtain || !objects.tentCurtain) return;
+      const d1 = camera.position.distanceTo(objects.gateCurtain.position);
+      const d2 = camera.position.distanceTo(objects.tentCurtain.position);
+      const target1 = d1 < 2*CUBIT ? Math.PI/2.5 : Math.PI/2;
+      const target2 = d2 < 1.5*CUBIT ? Math.PI/2.5 : Math.PI/2;
+      objects.gateCurtain.rotation.y += (target1 - objects.gateCurtain.rotation.y) * 0.15;
+      objects.tentCurtain.rotation.y += (target2 - objects.tentCurtain.rotation.y) * 0.15;
+    }
+
+    // ======= Movimento e colisão =======
+    const lookVec = new THREE.Vector3(); const tmp = new THREE.Vector3(); const speed = 3.0; // m/s
+    function tryMove(nextPos){
+      // colisão fina com AABB
+      for(const box of colliders){ if(box.containsPoint(nextPos)) return false; }
+      // manter dentro do pátio
+      const { courtyard } = DIM();
+      const halfL = courtyard.length/2 - 0.4*CUBIT; const halfW = courtyard.width/2 - 0.4*CUBIT;
+      nextPos.x = Math.max(-halfL, Math.min(halfL, nextPos.x));
+      nextPos.z = Math.max(-halfW, Math.min(halfW, nextPos.z));
+      camera.position.copy(nextPos); return true;
+    }
+    function update(dt){
+      let vx=0, vz=0; if(keys.has('KeyW')||keys.has('ArrowUp')) vz -= 1; if(keys.has('KeyS')||keys.has('ArrowDown')) vz += 1; if(keys.has('KeyA')||keys.has('ArrowLeft')) vx -= 1; if(keys.has('KeyD')||keys.has('ArrowRight')) vx += 1;
+      if(vx||vz){ controls.update(); camera.getWorldDirection(lookVec); lookVec.y=0; lookVec.normalize(); const right = tmp.copy(lookVec).cross(new THREE.Vector3(0,1,0)).normalize(); const move = new THREE.Vector3().addScaledVector(lookVec,vz).addScaledVector(right,vx).normalize().multiplyScalar(speed*dt); const next = camera.position.clone().add(move); tryMove(next); moveTarget=null; }
+      if(moveTarget){ const dir = tmp.copy(moveTarget).sub(camera.position); dir.y=0; const dist = dir.length(); if(dist<0.1){ moveTarget=null; } else { dir.normalize(); const next = camera.position.clone().add(dir.multiplyScalar(Math.min(speed*dt, dist))); tryMove(next);} }
+      controls.update(); updateCurtains(); drawMinimap();
+    }
+
+    function loop(){ const dt = Math.min(0.033, clock.getDelta()); update(dt); renderer.render(scene, camera); requestAnimationFrame(loop); }
+
+    window.addEventListener('resize', ()=>{ camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+    // Inicializa
+    buildScene();
+    setTimeout(()=>{ document.getElementById('loading').style.display='none'; loop(); }, 300);
+
+  </script>
+</body>
+</html>
